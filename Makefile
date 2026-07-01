@@ -15,6 +15,7 @@ test: dos.bin
 	python3 test/test_disk.py
 	python3 test/test_bam.py
 	python3 test/test_dir.py
+	python3 test/test_dir_nodisk.py
 	python3 test/test_file.py
 	python3 test/test_save.py
 	python3 test/test_cmd.py

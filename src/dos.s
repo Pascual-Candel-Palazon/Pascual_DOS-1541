@@ -1681,6 +1681,8 @@ disk_build_dir:
     lda #0
     sta want_sector
     jsr disk_read_sector_hw     ; BAM 18/0 -> DATA_DEC_BUF+1
+    lda fsec_error              ; sin disco / sin SYNC: la BAM no se ha leido.
+    bne @nodisk                 ; NO construir el listado sobre un buffer basura
     ldy #$00
 @cb:
     lda DATA_DEC_BUF+1,y
@@ -1734,6 +1736,17 @@ disk_build_dir:
     jmp @dirsec
 @fin:
     jsr dir_make_free_line
+    jsr dir_make_end
+    rts
+@nodisk:
+    ; sin disco: programa de directorio vacio y bien formado (sin basura).
+    ; list_ptr aun no se ha fijado en esta ruta, asi que lo fijamos aqui y
+    ; emitimos solo el marcador de fin ($00 $00). El C64 obtiene un programa
+    ; BASIC vacio limpio; el error 21 ya lo registra la capa de lectura.
+    lda #<LIST_BUF
+    sta list_ptr
+    lda #>LIST_BUF
+    sta list_ptr+1
     jsr dir_make_end
     rts
 

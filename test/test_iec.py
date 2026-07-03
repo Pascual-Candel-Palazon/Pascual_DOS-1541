@@ -292,6 +292,27 @@ def main():
                  "tx_len": [3, 0],
                  "tx_last": [0xFF]}))
 
+    # --- regresion: dos OPEN de canal 0 (LOAD) seguidos deben reiniciar
+    # data_idx cada vez. @sec_open solo reseteaba data_idx/iec_chan_mode en
+    # la rama de canal != 0 (SAVE); para canal 0 (LOAD) el indice se
+    # arrastraba de la peticion anterior. Con dos "$" seguidos el sintoma no
+    # se ve en el propio nombre (mismo caracter), pero data_idx queda en 2 en
+    # vez de 1: el segundo caracter aterriza en DATA_BUF[1], dejando
+    # DATA_BUF[0] con lo que fuera que escribiera disk_build_dir la vez
+    # anterior (DATA_BUF y LIST_BUF comparten direccion). iec_talk compara
+    # DATA_BUF[0] contra '$' para decidir si es el directorio: con el bug,
+    # la segunda peticion se malinterpreta como LOAD de fichero por nombre en
+    # vez de directorio. Confirmado en VICE de extremo a extremo (dos
+    # LOAD"$",8 seguidos colgaban la unidad en el segundo).
+    r.append(run_case("LOAD\"$\" dos veces seguidas: data_idx se reinicia en cada OPEN canal 0",
+        [("cmd", LISTEN | 8), ("cmd", 0xF0), ("unatn",),
+         ("data", ord('$'), True),
+         ("reatn",), ("cmd", UNLISTEN), ("unatn",),
+         ("reatn",), ("cmd", LISTEN | 8), ("cmd", 0xF0), ("unatn",),
+         ("data", ord('$'), True),
+         ("reatn",), ("cmd", UNLISTEN), ("unatn",)],
+        {"data_buf": [ord('$')], "listening": False}))
+
     print()
     if all(r):
         print("RESULTADO: OK  listener IEC con comandos, datos y EOI")

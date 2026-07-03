@@ -692,6 +692,9 @@ iec_atn:
 @sec_open:
     lda iec_sa                  ; canal 0 = LOAD; canal != 0 = posible SAVE
     bne @so_go
+    lda #$00                    ; canal 0: nombre nuevo, reiniciar el indice de
+    sta data_idx                ; recepcion. Sin esto, en una peticion posterior
+    sta iec_chan_mode           ; el nombre se acumula mal alineado en DATA_BUF.
     jmp @cmdloop
 @so_go:
     lda #$FF
@@ -1095,8 +1098,11 @@ disk_step_delay:
 disk_find_current_track:
     jsr disk_motor_on
     jsr disk_read_hdr_retry
-    lda hdr_track
-    sta cur_track
+    lda hdr_error                ; sin cabecera valida (p.ej. sin disco): no hay
+    bne @keep                    ; dato fiable de posicion, conservar cur_track
+    lda hdr_track                ; tal cual estaba, en vez de "olvidar" donde
+    sta cur_track                ; esta el cabezal y reseekear a ciegas cada vez
+@keep:
     rts
 
 ;  disk_read_hdr_retry: lee una cabecera valida reintentando hasta 24 veces. Tras
@@ -1108,12 +1114,19 @@ disk_read_hdr_retry:
     txa
     pha
     jsr disk_wait_sync
+    bcs @nosync         ; timeout: no hay SYNC, no leer (disk_read10 no tiene
+                         ; limite de tiempo y se quedaria esperando para siempre)
     jsr disk_read10
     lda #<RAW_BUF
     sta gcr_src
     lda #>RAW_BUF
     sta gcr_src+1
     jsr disk_read_header
+    jmp @chk
+@nosync:
+    lda #$FF
+    sta hdr_error
+@chk:
     pla
     tax
     lda hdr_error

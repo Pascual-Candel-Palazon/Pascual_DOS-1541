@@ -19,6 +19,8 @@ test: dos.bin
 	python3 test/test_file.py
 	python3 test/test_save.py
 	python3 test/test_cmd.py
+	python3 test/test_hdr_retry_nosync.py
+	python3 test/test_cur_track_preserved.py
 	python3 test/test_vice_ref.py
 
 clean:

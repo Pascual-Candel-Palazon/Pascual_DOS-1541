@@ -1,9 +1,15 @@
 import os, sys, subprocess, time
-if not os.path.exists('/tmp/Pascuals-BASIC/bin/kernal_c64.bin'):
-    subprocess.run('cd /tmp && git clone https://github.com/Pascual-Candel-Palazon/Pascuals-BASIC && cd Pascuals-BASIC && sh build.sh', shell=True)
+# ROMs libres del C64 (Pascuals-BASIC). Por defecto, clonado junto a este repo;
+# se puede indicar otra ruta con la variable de entorno PASCUALS_BASIC.
+PB=os.environ.get('PASCUALS_BASIC') or os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','Pascuals-BASIC'))
+if not os.path.exists(os.path.join(PB,'bin','kernal_c64.bin')):
+    if not os.path.isdir(PB):
+        subprocess.run(['git','clone','https://github.com/Pascual-Candel-Palazon/Pascuals-BASIC',PB])
+    subprocess.run('sh build.sh', shell=True, cwd=PB)
 sys.path.insert(0,'test')
 from vice_monitor import ViceMonitor, launch_x64sc
-B='/tmp/Pascuals-BASIC/bin'; WORK='/tmp/dos1541_sbl3'; os.makedirs(WORK,exist_ok=True)
+B=os.path.join(PB,'bin'); WORK='/tmp/dos1541_sbl3'; os.makedirs(WORK,exist_ok=True)
 DISK=WORK+'/disco.d64'
 subprocess.run('cp dos.bin %s/'%WORK,shell=True)
 subprocess.run('c1541 -format "p,01" d64 %s >/dev/null 2>&1'%DISK,shell=True)

@@ -85,12 +85,15 @@ def main():
     cases = [
         (0, 0, 0, "00, OK,00,00\r"),
         (1, 0, 0, "01, FILES SCRATCHED,00,00\r"),
-        (30, 0, 0, "30, SYNTAX ERROR,00,00\r"),
+        (21, 18, 0, "21,READ ERROR,18,00\r"),
+        (30, 0, 0, "30,SYNTAX ERROR,00,00\r"),
+        (34, 0, 0, "34,SYNTAX ERROR,00,00\r"),
         (62, 18, 1, "62, FILE NOT FOUND,18,01\r"),
         (63, 0, 0, "63, FILE EXISTS,00,00\r"),
-        (72, 0, 0, "72, DISK FULL,00,00\r"),
-        (99, 5, 9, "99, ERROR,05,09\r"),     # codigo desconocido -> generico
-        (20, 18, 5, "20, ERROR,18,05\r"),    # 20 no esta en la tabla -> generico
+        (72, 0, 0, "72,DISK FULL,00,00\r"),
+        (73, 0, 0, "73,PASCUAL DOS 1541,00,00\r"),
+        (99, 5, 9, "99,ERROR,05,09\r"),      # codigo desconocido -> generico
+        (20, 18, 5, "20,ERROR,18,05\r"),     # 20 no esta en la tabla -> generico
     ]
     for code, t, s, expected in cases:
         got = build_status(mpu, mem, labels, code, t, s)

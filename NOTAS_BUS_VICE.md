@@ -64,7 +64,7 @@ Resultado en VICE tras el fix: la unidad ya NO se cuelga (PC pasa de $C1FB a
 mainloop), el C64 completa la fase ATN y libera ATN (VIA1_PB $81 -> $03). Las 9
 baterias logicas siguen en verde.
 
-## Pendiente: muestreo de bits incorrecto (segundo bug)
+## Muestreo de bits incorrecto (segundo bug, resuelto mas abajo)
 
 Con instrumentacion temporal se vio que la unidad ahora recibe bytes (la estructura
 del handshake byte a byte progresa), pero su contenido es $FF $FF en vez del

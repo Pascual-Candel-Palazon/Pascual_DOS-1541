@@ -87,8 +87,8 @@ movimiento daba hdr_error.
 
 Nota sobre la zona de velocidad: las lecturas en pistas de zonas distintas (17 en
 zona 3, 24 en zona 2) funcionaron en VICE sin ajustar los bits 5-6 de PB. En
-hardware real el bitrate por zona debe coincidir con la pista; queda pendiente
-seleccionar la zona por pista para correccion fuera del emulador.
+hardware real el bitrate por zona debe coincidir con la pista. Resuelto despues
+con disk_set_speed_zone (ver la seccion de escritura).
 
 ## Lectura de un sector arbitrario y cadena completa (resuelto)
 

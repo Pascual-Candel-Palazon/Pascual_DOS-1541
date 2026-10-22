@@ -31,7 +31,20 @@ disassembled):
 - Directory: entry creation, listing (`LOAD "$",8`), and chaining beyond a single
   sector (more than eight files).
 - File LOAD and SAVE end to end over the bus, single and multi-sector.
-- Command and error channel (15): SCRATCH, RENAME, NEW (format) and VALIDATE.
+- Command and error channel (15) over the bus, by `OPEN 15,8,15,"..."` or
+  `PRINT#15`: SCRATCH (several names and `*`/`?` wildcards), RENAME, NEW,
+  VALIDATE, INITIALIZE and `UJ` (reset). The status string is read with
+  `INPUT#15` or byte by byte with `GET#15`, and LOAD, SAVE and the commands leave
+  their result there (for example 62 FILE NOT FOUND, 63 FILE EXISTS, 72 DISK
+  FULL). The power-on status is `73,PASCUAL DOS 1541,00,00`.
+- Wildcards in LOAD (`LOAD"*",8`, `LOAD"P*",8`). SAVE refuses an existing name
+  (63) instead of creating a duplicate entry.
+
+Not implemented yet: physical (low-level) formatting, so NEW only works on a
+disk that is already formatted (with an ID it rewrites the BAM and directory,
+not the sector headers); SEQ, USR and REL files and data channels other than
+LOAD and SAVE (every file is written as PRG); the C, B, M and remaining U
+commands (they answer 31,SYNTAX ERROR); write protect detection.
 
 Cross-checked against `c1541` as a reference and exercised from a C64 running both
 the original KERNAL and the free Pascuals-BASIC KERNAL.
@@ -131,7 +144,20 @@ desensambladas):
   alla de un solo sector (mas de ocho ficheros).
 - LOAD y SAVE de ficheros de extremo a extremo por el bus, de uno y de varios
   sectores.
-- Canal de comandos y errores (15): SCRATCH, RENAME, NEW (formatear) y VALIDATE.
+- Canal de comandos y errores (15) por el bus, con `OPEN 15,8,15,"..."` o
+  `PRINT#15`: SCRATCH (varios nombres y comodines `*`/`?`), RENAME, NEW,
+  VALIDATE, INITIALIZE y `UJ` (reinicio). La cadena de estado se lee con
+  `INPUT#15` o byte a byte con `GET#15`, y LOAD, SAVE y los comandos dejan alli su
+  resultado (por ejemplo 62 FILE NOT FOUND, 63 FILE EXISTS, 72 DISK FULL). El
+  estado de arranque es `73,PASCUAL DOS 1541,00,00`.
+- Comodines en LOAD (`LOAD"*",8`, `LOAD"P*",8`). SAVE rechaza un nombre que ya
+  existe (63) en vez de crear una entrada duplicada.
+
+Pendiente: formateo fisico (de bajo nivel), por lo que NEW solo funciona sobre un
+disco ya formateado (con ID reescribe la BAM y el directorio, no las cabeceras de
+los sectores); ficheros SEQ, USR y REL y canales de datos distintos de LOAD y SAVE
+(todo se graba como PRG); los comandos C, B, M y el resto de U (responden
+31,SYNTAX ERROR); deteccion de proteccion contra escritura.
 
 Contrastado contra `c1541` como referencia y ejercitado desde un C64 con el KERNAL
 original y con el KERNAL libre de Pascuals-BASIC.

@@ -213,6 +213,17 @@ cur_lo:      .res 1       ; numero de bloques de la entrada (lo)
 cur_hi:      .res 1       ; numero de bloques de la entrada (hi)
 list_dig:    .res 1       ; temporal (digitos / longitud / tipo)
 
+; --- canal de comandos por el bus ---
+cmd_pending: .res 1       ; $FF: comando recibido por el canal 15, pendiente
+stat_rd:     .res 1       ; indice de lectura del canal de estado (TALK 15)
+cmd_pos:     .res 1       ; posicion de lectura en CMD_BUF
+scr_count:   .res 1       ; ficheros borrados por SCRATCH
+dir_dirty:   .res 1       ; $FF si el sector de directorio en DIR_BUF cambio
+dir_guard:   .res 1       ; limite de sectores al recorrer el directorio
+walk_mode:   .res 1       ; 0 = SCRATCH, 1 = VALIDATE (dir_walk)
+chain_mode:  .res 1       ; 0 = liberar bloques, 1 = marcarlos ocupados
+chain_lim:   .res 2       ; limite de bloques al recorrer una cadena
+
 .code
 ; ----------------------------------------------------------------------------
 reset:
@@ -248,6 +259,14 @@ reset:
     sta iec_save_opening
     sta save_active
     sta iec_send_eoi
+    sta cmd_pending
+    sta save_err
+    lda #73                     ; estado de arranque: identificacion del DOS
+    sta err_code
+    lda #$00
+    sta err_track
+    sta err_sector
+    jsr status_set
 
 .ifdef PHYS_TEST
     jsr disk_phys_test          ; prueba de la capa fisica (ensamblar con -D PHYS_TEST)
@@ -280,6 +299,10 @@ reset:
 ;  bucle principal
 ; ----------------------------------------------------------------------------
 mainloop:
+    lda cmd_pending             ; comando del canal 15 recibido: ejecutarlo antes
+    beq @nocmd                  ; de atender el bus (el hardware sostiene DATA bajo
+    jsr cmd_execute             ; ATN mientras tanto y el host espera)
+@nocmd:
     lda VIA1_PB
     and #ATN_IN
     bne @atn
@@ -342,7 +365,15 @@ iec_recv_data:
 ;  iec_talk: turnaround y transmision del buffer de prueba como talker
 ; ----------------------------------------------------------------------------
 iec_talk:
+    lda iec_sa
+    cmp #15
+    bne @data
+    jsr iec_talk_status         ; TALK sobre el canal 15: cadena de estado
+    jmp @done
+@data:
     jsr iec_turnaround
+    lda iec_abort
+    bne @done                   ; ATN durante el turnaround
     ; elegir el origen de los datos a transmitir segun el nombre recibido
     lda DATA_BUF
     cmp #'$'                    ; LOAD "$": directorio
@@ -374,8 +405,11 @@ iec_talk:
     rts
 
 ;  iec_turnaround: la 1541 toma el rol de talker (asierta CLK, libera DATA) y
-;  espera a que el host se vuelva listener (asierte DATA).
+;  espera a que el host se vuelva listener (asierte DATA). Si el host retoma ATN
+;  antes, iec_abort = $FF.
 iec_turnaround:
+    lda #$00
+    sta iec_abort
     lda VIA1_PB
     ora #CLK_OUT
     sta VIA1_PB
@@ -384,8 +418,45 @@ iec_turnaround:
     sta VIA1_PB
 @w_listener:
     lda VIA1_PB
+    and #ATN_IN
+    bne @abort
+    lda VIA1_PB
     and #DATA_IN
     beq @w_listener
+    rts
+@abort:
+    lda #$FF
+    sta iec_abort
+    rts
+
+;  iec_talk_status: envia la cadena de estado (STATUS_BUF) desde stat_rd. El
+;  ultimo byte (el CR) lleva EOI. Si el host corta con ATN a mitad (GET# lee un
+;  byte por TALK), la posicion se conserva para el siguiente TALK. Leido entero,
+;  el estado vuelve a "00, OK,00,00".
+iec_talk_status:
+    jsr iec_turnaround
+    lda iec_abort
+    bne @ret
+@loop:
+    ldx stat_rd
+    lda STATUS_BUF,x
+    sta iec_out
+    inx
+    lda #$00
+    cpx stat_idx
+    bne @noeoi
+    lda #$FF
+@noeoi:
+    sta iec_send_eoi
+    jsr iec_send_byte
+    lda iec_abort
+    bne @ret                    ; ATN: el byte no se consumio
+    inc stat_rd
+    lda stat_rd
+    cmp stat_idx
+    bcc @loop
+    jsr status_ok               ; mensaje completo
+@ret:
     rts
 
 ;  iec_talk_send: turnaround y transmision del buffer ya preparado en tx_ptr/tx_len.
@@ -420,6 +491,8 @@ iec_send_buffer:
     lda (tx_ptr),y
     sta iec_out
     jsr iec_send_byte
+    lda iec_abort
+    bne @done                   ; el host retomo ATN: cortar la transmision
     inc tx_ptr                  ; avanzar puntero
     bne @nohi
     inc tx_ptr+1
@@ -504,17 +577,35 @@ iec_load_file:
     lda #$FF
     sta tx_last
     jsr iec_send_buffer
-    rts                         ; fichero completo
+    jmp status_ok               ; fichero completo: estado 00
 @notlast:
     lda #$00
     sta tx_last
     jsr iec_send_buffer
+    lda iec_abort
+    bne @ret                    ; el host corto la carga
     lda file_next_track         ; seguir la cadena
     sta want_track
     lda file_next_sector
     sta want_sector
     jmp @blockloop
 @notfound:
+    ; Nada que enviar: soltar CLK y DATA. El host ve al talker listo y no recibe
+    ; ningun bit (fin por tiempo, lo que interpreta como fichero no encontrado).
+    ; Con CLK retenido el host esperaria indefinidamente.
+    lda VIA1_PB
+    and #<~(CLK_OUT | DATA_OUT)
+    sta VIA1_PB
+    lda fsec_error              ; error de lectura (21) o fichero inexistente (62)
+    bne @rderr
+    lda #62
+    jsr set_error
+    jmp status_set
+@rderr:
+    lda #21
+    jsr set_rw_error
+    jmp status_set
+@ret:
     rts
 
 ; ----------------------------------------------------------------------------
@@ -522,12 +613,18 @@ iec_load_file:
 ;  realiza el handshake de EOI antes de los bits.
 ; ----------------------------------------------------------------------------
 iec_send_byte:
+    lda #$00
+    sta iec_abort
     ; talker listo: liberar CLK
     lda VIA1_PB
     and #CLK_OUT_CLR
     sta VIA1_PB
-    ; esperar listener listo: DATA liberada
+    ; esperar listener listo: DATA liberada. Si el host retoma ATN en vez de
+    ; liberar DATA (cierra el canal entre bytes), abortar sin enviar.
 @w_drel:
+    lda VIA1_PB
+    and #ATN_IN
+    bne @abort
     lda VIA1_PB
     and #DATA_IN
     bne @w_drel
@@ -600,6 +697,10 @@ iec_send_byte:
     ora #CLK_OUT
     sta VIA1_PB
     rts
+@abort:
+    lda #$FF
+    sta iec_abort
+    rts
 
 ; ----------------------------------------------------------------------------
 ;  iec_atn: atiende comandos mientras ATN este asserted
@@ -637,6 +738,17 @@ iec_atn:
     lda iec_state
     and #ST_LISTEN_CLR
     sta iec_state
+    lda iec_chan_mode           ; fin de un envio al canal 15: si trajo texto,
+    cmp #2                      ; queda un comando pendiente de ejecutar
+    bne @ul_done
+    lda data_idx
+    beq @ul_empty
+    lda #$FF
+    sta cmd_pending
+@ul_empty:
+    lda #$00
+    sta iec_chan_mode
+@ul_done:
     jmp @cmdloop
 @not_unlisten:
     cmp #$5F
@@ -690,6 +802,15 @@ iec_atn:
     beq @sec_close
     jmp @cmdloop
 @sec_open:
+    lda iec_sa
+    cmp #15
+    bne @so_not15
+    lda #$00                    ; OPEN 15: el nombre es un comando
+    sta data_idx
+    lda #2
+    sta iec_chan_mode
+    jmp @cmdloop
+@so_not15:
     lda iec_sa                  ; canal 0 = LOAD; canal != 0 = posible SAVE
     bne @so_go
     lda #$00                    ; canal 0: nombre nuevo, reiniciar el indice de
@@ -704,6 +825,19 @@ iec_atn:
     sta iec_chan_mode
     jmp @cmdloop
 @sec_data:
+    lda iec_sa
+    cmp #15
+    bne @sd_not15
+    lda iec_state               ; DATA 15 como listener: llega un comando (PRINT#15).
+    and #ST_LISTEN              ; Como talker no hay nada que preparar: iec_talk
+    beq @sd15_done              ; sirve el estado.
+    lda #$00
+    sta data_idx
+    lda #2
+    sta iec_chan_mode
+@sd15_done:
+    jmp @cmdloop
+@sd_not15:
     lda iec_sa
     bne @sd_go
     jmp @cmdloop                ; canal 0 (LOAD lo gestiona iec_talk)
@@ -723,6 +857,13 @@ iec_atn:
     sta iec_chan_mode           ; los datos que siguen -> file_save_byte
     jmp @cmdloop
 @sec_close:
+    lda iec_sa
+    cmp #15
+    bne @sc_not15
+    lda #$00                    ; CLOSE 15: nada que grabar
+    sta iec_chan_mode
+    jmp @cmdloop
+@sc_not15:
     lda iec_sa
     bne @sc_go
     jmp @cmdloop
@@ -1442,7 +1583,31 @@ file_save_open:
     sta save_blocks_lo
     sta save_blocks_hi
     sta save_err
+    sta save_active
+    jsr name_has_wild           ; un nombre con comodines no se puede grabar
+    beq @namok
+    lda #33
+    bne @refuse                 ; siempre
+@namok:
+    jsr dir_find_chain          ; ya existe? (DIR_BUF = SAVE_BUF, aun sin datos)
+    lda dir_found
+    beq @new
+    lda #63                     ; FILE EXISTS: no se graba
+    bne @refuse                 ; siempre
+@new:
+    lda fsec_error              ; directorio ilegible
+    beq @rdok
+    lda #21
+    jsr set_rw_error
+    jmp @refuse2
+@rdok:
     jsr save_bam_load           ; BAM a RAM una sola vez
+    lda fsec_error
+    beq @bamok
+    lda #21
+    jsr set_rw_error
+    jmp @refuse2
+@bamok:
     jsr save_alloc_block
     lda alloc_ok
     beq @full
@@ -1459,6 +1624,11 @@ file_save_open:
     sta save_active
     rts
 @full:
+    lda #72                     ; DISK FULL
+@refuse:
+    jsr set_error
+@refuse2:
+    jsr status_set
     lda #$FF
     sta save_err
     lda #$00
@@ -1466,8 +1636,11 @@ file_save_open:
     rts
 
 ;  file_save_byte: anade el byte en A al sector en construccion. Al llenarlo (256)
-;  asigna el siguiente bloque, fija el enlace y graba el sector actual.
+;  asigna el siguiente bloque, fija el enlace y graba el sector actual. Sin un
+;  SAVE activo (rechazado o disco lleno a mitad) los bytes se descartan.
 file_save_byte:
+    ldx save_active
+    beq @ret
     ldx save_idx
     sta SAVE_BUF,x
     inc save_idx
@@ -1475,8 +1648,13 @@ file_save_byte:
     jsr save_alloc_block
     lda alloc_ok
     bne @ok
+    lda #72                     ; disco lleno a mitad: se abandona el SAVE. La BAM
+    jsr set_error               ; del disco no se toca, asi que los bloques ya
+    jsr status_set              ; escritos siguen libres en ella (sin perdidas).
     lda #$FF
     sta save_err
+    lda #$00
+    sta save_active
     rts
 @ok:
     lda alloc_track
@@ -1681,7 +1859,13 @@ file_save_close:
     jsr save_bam_flush          ; graba la BAM a disco una sola vez
     lda #$00
     sta save_active
-    rts
+    lda fsec_error
+    beq @ok
+    lda #25                     ; fallo al grabar la BAM
+    jsr set_rw_error
+    jmp status_set
+@ok:
+    jmp status_ok
 
 ;  disk_build_dir: genera el programa BASIC del directorio (LOAD "$",8) en LIST_BUF
 ;  leyendo el disco fisico. Lee el BAM (18/0) para el titulo y el recuento de
@@ -1750,7 +1934,7 @@ disk_build_dir:
 @fin:
     jsr dir_make_free_line
     jsr dir_make_end
-    rts
+    jmp status_ok
 @nodisk:
     ; sin disco: programa de directorio vacio y bien formado (sin basura).
     ; list_ptr aun no se ha fijado en esta ruta, asi que lo fijamos aqui y
@@ -1760,8 +1944,13 @@ disk_build_dir:
     sta list_ptr
     lda #>LIST_BUF
     sta list_ptr+1
-    jsr dir_make_end
-    rts
+    jsr dir_make_end            ; dos bytes que el host toma como direccion
+    jsr dir_make_end            ; y el fin de programa ($00 $00). Con solo dos,
+                                ; el EOI llega en la direccion y un KERNAL que
+                                ; pide un byte mas espera indefinidamente.
+    lda #21
+    jsr set_rw_error
+    jmp status_set
 
 ;  disk_set_speed_zone: fija el bitrate (bits 5-6 de VIA2_PB) segun la zona de
 ;  velocidad de want_track. Pistas 1-17 zona 3 ($60), 18-24 zona 2 ($40), 25-30
@@ -2501,20 +2690,8 @@ dir_find_in_buf:
     lda DIR_BUF,y
     and #$0F                ; tipo (bits 0-3)
     beq @next               ; 0 -> entrada vacia o borrada
-    ; comparar 16 bytes del nombre
-    lda dir_slot
-    clc
-    adc #5
-    tay
-    ldx #0
-@cmp:
-    lda DIR_BUF,y
-    cmp NAME_BUF,x
-    bne @next
-    iny
-    inx
-    cpx #16
-    bne @cmp
+    jsr name_match          ; nombre (con comodines '*' y '?')
+    beq @next
     ; coincide
     jsr dir_extract
     lda #$FF
@@ -3126,6 +3303,607 @@ disk_format_bam:
     rts
 
 ; ----------------------------------------------------------------------------
+;  Estado del canal 15 y ejecucion de comandos recibidos por el bus.
+;  Formato observable: "NN,MENSAJE,TT,SS" + CR. Tras leerse entero vuelve a 00.
+; ----------------------------------------------------------------------------
+;  set_error: err_code = A, pista y sector a 0.
+set_error:
+    sta err_code
+    lda #$00
+    sta err_track
+    sta err_sector
+    rts
+
+;  set_rw_error: err_code = A, con la pista y el sector de la ultima operacion.
+set_rw_error:
+    sta err_code
+    lda want_track
+    sta err_track
+    lda want_sector
+    sta err_sector
+    rts
+
+;  status_ok: estado "00, OK,00,00".
+status_ok:
+    lda #$00
+    jsr set_error
+    ; continua en status_set
+
+;  status_set: construye la cadena de err_code/err_track/err_sector y la deja
+;  lista para leerse desde el principio.
+status_set:
+    jsr err_build_status
+    lda #$00
+    sta stat_rd
+    rts
+
+;  cmd_execute: ejecuta el comando recibido por el canal 15 (DATA_BUF, data_idx
+;  bytes). Se copia a CMD_BUF sin el CR final y terminado en 0. Un envio vacio no
+;  cambia el estado.
+cmd_execute:
+    lda #$00
+    sta cmd_pending
+    ldx #$00
+@cp:
+    cpx data_idx
+    beq @end
+    cpx #39                     ; CMD_BUF: 39 caracteres + terminador
+    beq @end
+    lda DATA_BUF,x
+    cmp #$0D
+    beq @end
+    sta CMD_BUF,x
+    inx
+    bne @cp
+@end:
+    lda #$00
+    sta CMD_BUF,x
+    sta data_idx
+    txa
+    beq @ret                    ; sin texto: nada que hacer
+    lda #$00
+    jsr set_error               ; por defecto 00 (cada comando lo ajusta)
+    lda CMD_BUF
+    cmp #'S'
+    bne @n_s
+    jsr cmd_scratch
+    jmp @fin
+@n_s:
+    cmp #'R'
+    bne @n_r
+    jsr cmd_rename
+    jmp @fin
+@n_r:
+    cmp #'N'
+    bne @n_n
+    jsr cmd_new
+    jmp @fin
+@n_n:
+    cmp #'V'
+    bne @n_v
+    jsr cmd_validate
+    jmp @fin
+@n_v:
+    cmp #'I'
+    bne @n_i
+    jsr cmd_init
+    jmp @fin
+@n_i:
+    cmp #'U'
+    bne @n_u
+    jsr cmd_user
+    jmp @fin
+@n_u:
+    lda #31                     ; orden desconocida o no implementada
+    jsr set_error
+@fin:
+    jsr status_set
+@ret:
+    rts
+
+;  cmd_find_colon: cmd_pos = posicion tras el ':' de CMD_BUF. C = 1 si no hay ':'.
+cmd_find_colon:
+    ldx #$00
+@f:
+    lda CMD_BUF,x
+    beq @no
+    inx
+    cmp #':'
+    bne @f
+    stx cmd_pos
+    clc
+    rts
+@no:
+    sec
+    rts
+
+;  cmd_next_name: copia a NAME_BUF (16 bytes, relleno $A0) el siguiente nombre de
+;  CMD_BUF desde cmd_pos, hasta ',' o fin, y deja cmd_pos tras la ','. Un nombre
+;  de mas de 16 caracteres se trunca. A = $FF si habia nombre, $00 si no quedan.
+cmd_next_name:
+    ldx cmd_pos
+    lda CMD_BUF,x
+    bne @go
+    lda #$00
+    rts
+@go:
+    ldy #$00
+@c:
+    lda CMD_BUF,x
+    beq @pad
+    inx
+    cmp #','
+    beq @pad
+    cpy #16
+    bcs @c                      ; truncar
+    sta NAME_BUF,y
+    iny
+    bne @c                      ; siempre
+@pad:
+    stx cmd_pos
+    lda #$A0
+@p:
+    cpy #16
+    beq @ok
+    sta NAME_BUF,y
+    iny
+    bne @p                      ; siempre
+@ok:
+    lda #$FF
+    rts
+
+;  name_has_wild: A = $FF (Z = 0) si NAME_BUF contiene '*' o '?', $00 si no.
+name_has_wild:
+    ldx #$00
+@l:
+    lda NAME_BUF,x
+    cmp #'*'
+    beq @yes
+    cmp #'?'
+    beq @yes
+    inx
+    cpx #16
+    bne @l
+    lda #$00
+    rts
+@yes:
+    lda #$FF
+    rts
+
+;  name_match: compara el patron de NAME_BUF con el nombre de la entrada en
+;  dir_slot de DIR_BUF. '*' acepta el resto del nombre; '?' un caracter
+;  cualquiera (no el relleno). A = $FF (Z = 0) si coincide, $00 si no.
+name_match:
+    lda dir_slot
+    clc
+    adc #5
+    tay
+    ldx #$00
+@l:
+    lda NAME_BUF,x
+    cmp #'*'
+    beq @yes
+    cmp #'?'
+    bne @lit
+    lda DIR_BUF,y
+    cmp #$A0
+    beq @no
+    bne @next                   ; siempre
+@lit:
+    cmp DIR_BUF,y
+    bne @no
+@next:
+    iny
+    inx
+    cpx #16
+    bne @l
+@yes:
+    lda #$FF
+    rts
+@no:
+    lda #$00
+    rts
+
+;  bam_load_chk: lee la BAM (18/0) a BAM_BUF. C = 1 y estado 21 si no se pudo.
+bam_load_chk:
+    jsr save_bam_load
+    lda fsec_error
+    bne @err
+    clc
+    rts
+@err:
+    lda #21
+    jsr set_rw_error
+    sec
+    rts
+
+;  bam_flush_chk: graba BAM_BUF en 18/0. C = 1 y estado 25 si fallo.
+bam_flush_chk:
+    jsr save_bam_flush
+    lda fsec_error
+    bne @err
+    clc
+    rts
+@err:
+    lda #25
+    jsr set_rw_error
+    sec
+    rts
+
+;  dir_write_cur: graba DIR_BUF en el sector de directorio en curso
+;  (dir_chain_track/sector). fsec_error indica el resultado.
+dir_write_cur:
+    ldx #$00
+@cp:
+    lda DIR_BUF,x
+    sta DATA_DEC_BUF+1,x
+    inx
+    bne @cp
+    lda dir_chain_track
+    sta want_track
+    lda dir_chain_sector
+    sta want_sector
+    jmp save_write_dec_to
+
+;  chain_walk: recorre la cadena de bloques de un fichero desde dir_track/
+;  dir_sector. chain_mode 0 libera cada bloque en BAM_BUF, 1 lo marca ocupado.
+;  Se detiene en el ultimo bloque, en un enlace fuera de rango, en un error de
+;  lectura o al superar 683 bloques (cadena en bucle). DIR_BUF no se toca.
+chain_walk:
+    lda dir_track
+    sta file_next_track
+    lda dir_sector
+    sta file_next_sector
+    lda #<683
+    sta chain_lim
+    lda #>683
+    sta chain_lim+1
+@l:
+    jsr disk_link_valid
+    beq @done
+    lda file_next_track
+    sta bam_track
+    sta want_track
+    lda file_next_sector
+    sta bam_sector
+    sta want_sector
+    lda chain_mode
+    bne @mark
+    jsr bam_free_block
+    jmp @rd
+@mark:
+    jsr bam_alloc
+@rd:
+    jsr disk_read_sector_hw
+    lda fsec_error
+    bne @done
+    lda DATA_DEC_BUF+1
+    sta file_next_track
+    lda DATA_DEC_BUF+2
+    sta file_next_sector
+    lda chain_lim
+    bne @dl
+    dec chain_lim+1
+@dl:
+    dec chain_lim
+    lda chain_lim
+    ora chain_lim+1
+    bne @l
+@done:
+    rts
+
+;  dir_walk: recorre la cadena de sectores de directorio. walk_mode 0 (SCRATCH):
+;  las entradas que casan con el patron de NAME_BUF liberan su cadena y se
+;  borran (scr_count las cuenta). walk_mode 1 (VALIDATE): marca ocupados los
+;  sectores de directorio y las cadenas de las entradas cerradas, y borra las
+;  entradas no cerradas. Los sectores modificados se reescriben. C = 1 si hubo
+;  error de lectura o escritura (estado ya fijado).
+dir_walk:
+    lda #18
+    sta dir_chain_track
+    lda #1
+    sta dir_chain_sector
+    lda #19                     ; la pista 18 tiene 19 sectores
+    sta dir_guard
+@sec:
+    lda dir_chain_track
+    sta want_track
+    lda dir_chain_sector
+    sta want_sector
+    jsr disk_read_sector_hw
+    lda fsec_error
+    beq @rdok
+    lda #21
+    jsr set_rw_error
+    sec
+    rts
+@rdok:
+    ldx #$00
+@cp:
+    lda DATA_DEC_BUF+1,x
+    sta DIR_BUF,x
+    inx
+    bne @cp
+    jsr dir_get_link
+    lda #$00
+    sta dir_dirty
+    sta dir_slotnum
+    lda walk_mode
+    beq @slot
+    lda #18                     ; VALIDATE: el propio sector de directorio
+    sta bam_track
+    lda dir_chain_sector
+    sta bam_sector
+    jsr bam_alloc
+@slot:
+    lda dir_slotnum
+    asl a
+    asl a
+    asl a
+    asl a
+    asl a
+    sta dir_slot
+    tax
+    lda DIR_BUF+2,x
+    and #$0F
+    beq @nx                     ; entrada vacia o borrada
+    lda walk_mode
+    bne @val
+    jsr name_match
+    beq @nx
+    jsr dir_extract
+    lda #0
+    sta chain_mode
+    jsr chain_walk              ; liberar sus bloques
+    inc scr_count
+    jmp @kill
+@val:
+    ldx dir_slot
+    lda DIR_BUF+2,x
+    bmi @keep                   ; bit 7 = fichero cerrado
+@kill:
+    ldx dir_slot
+    lda #$00
+    sta DIR_BUF+2,x
+    lda #$FF
+    sta dir_dirty
+    jmp @nx
+@keep:
+    jsr dir_extract
+    lda #1
+    sta chain_mode
+    jsr chain_walk              ; marcar sus bloques
+@nx:
+    inc dir_slotnum
+    lda dir_slotnum
+    cmp #8
+    bne @slot
+    lda dir_dirty
+    beq @nowr
+    jsr dir_write_cur
+    lda fsec_error
+    beq @nowr
+    lda #25
+    jsr set_rw_error
+    sec
+    rts
+@nowr:
+    lda dir_link_track
+    beq @end
+    dec dir_guard
+    beq @end
+    lda dir_link_track
+    sta dir_chain_track
+    lda dir_link_sector
+    sta dir_chain_sector
+    jmp @sec
+@end:
+    clc
+    rts
+
+;  cmd_scratch: "S:patron[,patron...]". Borra los ficheros que casan y libera
+;  sus bloques. Estado 01, FILES SCRATCHED,nn,00 con nn = ficheros borrados.
+cmd_scratch:
+    jsr cmd_find_colon
+    bcs @noname
+    lda #$00
+    sta scr_count
+    sta walk_mode
+    jsr cmd_next_name
+    beq @report                 ; "S:" sin nombre: nada borrado (01,...,00)
+    lda NAME_BUF
+    cmp #$A0
+    beq @report
+    jsr bam_load_chk
+    bcs @ret
+@pat:
+    jsr dir_walk
+    bcs @flush                  ; error: conservar lo ya borrado (estado fijado)
+    jsr cmd_next_name
+    bne @pat
+    lda scr_count
+    beq @report
+    jsr bam_flush_chk
+    bcs @ret
+@report:
+    lda #1
+    jsr set_error
+    lda scr_count
+    cmp #100
+    bcc @n
+    lda #99
+@n:
+    sta err_track
+@ret:
+    rts
+@flush:
+    lda scr_count
+    beq @ret
+    lda err_code                ; la BAM debe reflejar los borrados ya escritos
+    pha
+    lda err_track
+    pha
+    lda err_sector
+    pha
+    jsr save_bam_flush
+    pla
+    sta err_sector
+    pla
+    sta err_track
+    pla
+    sta err_code
+    rts
+@noname:
+    lda #34
+    jmp set_error
+
+;  cmd_rename: "R:nuevo=viejo". 63 si el nuevo ya existe, 62 si el viejo no.
+cmd_rename:
+    jsr cmd_parse_rename
+    lda cmd_error
+    bne @syn
+    lda NAME_BUF
+    cmp #$A0
+    beq @noname
+    lda NAME_BUF2
+    cmp #$A0
+    beq @noname
+    ldx #15                     ; el nombre nuevo pasa a NAME_BUF para buscarlo
+@cp:
+    lda NAME_BUF2,x
+    sta NAME_BUF,x
+    dex
+    bpl @cp
+    jsr name_has_wild
+    bne @syn33                  ; el nombre nuevo no admite comodines
+    jsr dir_find_chain
+    lda dir_found
+    bne @exists
+    lda fsec_error
+    bne @rderr
+    jsr cmd_parse_rename        ; restaurar NAME_BUF = viejo, NAME_BUF2 = nuevo
+    jsr dir_find_chain
+    lda dir_found
+    beq @notfound
+    jsr dir_rename_entry
+    jsr dir_write_cur
+    lda fsec_error
+    bne @wrerr
+    rts                         ; estado 00
+@notfound:
+    lda fsec_error
+    bne @rderr
+    lda #62
+    jmp set_error
+@exists:
+    lda #63
+    jmp set_error
+@rderr:
+    lda #21
+    jmp set_rw_error
+@wrerr:
+    lda #25
+    jmp set_rw_error
+@syn:
+    lda #30
+    jmp set_error
+@syn33:
+    lda #33
+    jmp set_error
+@noname:
+    lda #34
+    jmp set_error
+
+;  cmd_new: "N:nombre[,id]". Reinicializa la BAM (todos los bloques libres) y el
+;  directorio con el nombre dado. Sin ID conserva el del disco. No hace formateo
+;  fisico de las pistas: requiere un disco ya formateado.
+cmd_new:
+    jsr cmd_find_colon
+    bcs @noname
+    jsr cmd_next_name           ; nombre del disco -> NAME_BUF
+    beq @noname
+    lda NAME_BUF
+    cmp #$A0
+    beq @noname
+    ldx cmd_pos
+    lda CMD_BUF,x
+    beq @keepid                 ; sin ',id'
+    sta NAME_BUF2
+    lda CMD_BUF+1,x
+    bne @id2
+    lda #$A0
+@id2:
+    sta NAME_BUF2+1
+    jmp @fmt
+@keepid:
+    jsr bam_load_chk            ; ID actual del disco, de la BAM
+    bcs @ret
+    lda BAM_BUF+162
+    sta NAME_BUF2
+    lda BAM_BUF+163
+    sta NAME_BUF2+1
+@fmt:
+    jsr disk_format_bam
+    jsr disk_write_header
+    jsr bam_flush_chk
+    bcs @ret
+    ldx #$00                    ; primer sector de directorio vacio (18/1)
+    txa
+@z:
+    sta DATA_DEC_BUF+1,x
+    inx
+    bne @z
+    lda #$FF
+    sta DATA_DEC_BUF+2          ; enlace 00 FF: ultimo sector de la cadena
+    lda #18
+    sta want_track
+    lda #1
+    sta want_sector
+    jsr save_write_dec_to
+    lda fsec_error
+    beq @ret
+    lda #25
+    jmp set_rw_error
+@ret:
+    rts
+@noname:
+    lda #34
+    jmp set_error
+
+;  cmd_validate: "V". Reconstruye la BAM a partir del directorio: marca los
+;  sectores de directorio y las cadenas de los ficheros cerrados, y elimina las
+;  entradas de ficheros no cerrados. Conserva el nombre y el ID del disco.
+cmd_validate:
+    jsr bam_load_chk
+    bcs @ret
+    jsr disk_format_bam         ; bitmap a "todo libre" salvo 18/0 y 18/1
+    lda #1
+    sta walk_mode
+    jsr dir_walk
+    bcs @ret
+    jsr bam_flush_chk
+@ret:
+    rts
+
+;  cmd_init: "I". Lee la BAM del disco (21 si no se puede).
+cmd_init:
+    jsr bam_load_chk
+    rts
+
+;  cmd_user: "UJ" o "U:" reinician la unidad (estado 73). El resto de ordenes U
+;  no estan implementadas (31).
+cmd_user:
+    lda CMD_BUF+1
+    cmp #'J'
+    beq @reset
+    cmp #':'
+    beq @reset
+    lda #31
+    jmp set_error
+@reset:
+    jmp reset
+
+; ----------------------------------------------------------------------------
 ;  Listado de directorio (LOAD "$",8). La unidad genera un pseudo-programa BASIC
 ;  que el C64 LISTa como directorio. Cada linea es: enlace (2 bytes, no nulo, que
 ;  el cargador re-vincula), numero de linea (2 bytes LE = numero de bloques),
@@ -3374,28 +4152,46 @@ free_text:
     .byte "BLOCKS FREE.", 0
 
 ; --- canal de estado: tabla de codigos y mensajes (subconjunto del DOS) ---
+;     Codigos en decimal. El espacio inicial de algunos mensajes reproduce la
+;     cadena que entrega una 1541 de referencia por el bus (contraste de caja
+;     negra, test/oracle_estado_vice.py).
 err_tab:
-    .byte $00
+    .byte 0
     .word msg_ok
-    .byte $01
+    .byte 1
     .word msg_scratched
-    .byte $1E                ; 30 decimal: SYNTAX ERROR
+    .byte 21
+    .word msg_read
+    .byte 25
+    .word msg_write
+    .byte 30
     .word msg_syntax
-    .byte $3E                ; 62 decimal: FILE NOT FOUND
+    .byte 31
+    .word msg_syntax
+    .byte 33
+    .word msg_syntax
+    .byte 34
+    .word msg_syntax
+    .byte 62
     .word msg_notfound
-    .byte $3F                ; 63 decimal: FILE EXISTS
+    .byte 63
     .word msg_exists
-    .byte $48                ; 72 decimal: DISK FULL
+    .byte 72
     .word msg_full
+    .byte 73
+    .word msg_dosid
     .byte $FF                ; por defecto
     .word msg_generic
 msg_ok:        .byte " OK", 0
 msg_scratched: .byte " FILES SCRATCHED", 0
-msg_syntax:    .byte " SYNTAX ERROR", 0
+msg_read:      .byte "READ ERROR", 0
+msg_write:     .byte "WRITE ERROR", 0
+msg_syntax:    .byte "SYNTAX ERROR", 0
 msg_notfound:  .byte " FILE NOT FOUND", 0
 msg_exists:    .byte " FILE EXISTS", 0
-msg_full:      .byte " DISK FULL", 0
-msg_generic:   .byte " ERROR", 0
+msg_full:      .byte "DISK FULL", 0
+msg_dosid:     .byte "PASCUAL DOS 1541", 0
+msg_generic:   .byte "ERROR", 0
 
 .segment "VECTORS"
     .word nmi

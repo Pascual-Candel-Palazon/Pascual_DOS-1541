@@ -69,7 +69,7 @@ el proyecto limpio.
    (LISTEN, TALK, UNLISTEN, UNTALK, direccion secundaria). Verificado con
    co-simulacion: un controlador C64 simulado dialoga con la 1541 a traves de
    un modelo de las lineas del bus (test/test_iec.py).
-   Pendiente de validar en VICE: polaridad fisica de los bits de VIA1 y timing.
+   Validado despues en VICE (polaridad y timing reales, ver NOTAS_BUS_VICE.md).
 1b. (hecho) Recepcion de datos con deteccion de EOI (ultimo byte) y bucle de
    recepcion: tras un LISTEN con ATN ya liberado, recibe bytes hasta EOI o
    hasta que el controlador retome ATN, dejandolos en un buffer provisional.
@@ -78,7 +78,7 @@ el proyecto limpio.
    detecta en el ultimo byte y que NO se dispara en transferencia normal.
    Limitacion conocida: el manejo de ATN a mitad de byte requiere la IRQ de CA1
    (no implementada aun); la version actual solo aborta entre bytes.
-   Pendiente de validar en VICE: polaridad fisica y valor del timeout en us.
+   Validado despues en VICE (ver NOTAS_BUS_VICE.md).
 1c. (hecho) Rol de TALKER: turnaround talk-attention (tras recibir TALK +
    canal y liberarse ATN, la 1541 toma CLK y el host pasa a listener) y envio
    de byte con EOI opcional en el ultimo. Verificado en co-simulacion con el
@@ -86,7 +86,9 @@ el proyecto limpio.
    en el ultimo byte. El cierre con UNTALK devuelve la 1541 a rol listener.
    Limitacion conocida: igual que en recepcion, el manejo de ATN a mitad de
    transferencia requiere la IRQ de CA1, no implementada aun.
-   Pendiente de validar en VICE: polaridad fisica, retardos y timeout en us.
+   Validado despues en VICE. Como talker, la espera de listener listo vigila
+   ATN: si el host cierra el canal entre bytes (GET# hace un TALK por byte) la
+   transmision se corta sin perder la posicion.
 2a. (hecho) Codec GCR (formato publico, codificacion 4-a-5 bits): rutinas
    gcr_encode (4 bytes -> 5) y gcr_decode (5 -> 4) con sus tablas directa e
    inversa. Verificado como logica pura (sin timing) en test/test_gcr.py: el
@@ -146,8 +148,7 @@ el proyecto limpio.
    final en el ultimo) y los datos. Verificado en test/test_file.py: los bloques
    producidos coinciden con la referencia y el round-trip escritura->lectura
    (SAVE->LOAD) recupera el contenido en ficheros de 1 a 4 bloques.
-   Pendiente para un SAVE completo: asignar los bloques con el BAM y crear la
-   entrada de directorio (3c y escritura de entrada).
+   El SAVE completo se cierra en 3c.
 3c. (hecho) Asignacion de bloques con bam_alloc_next (politica simple, sin
    intercalado todavia) y creacion de entrada de directorio con dir_make_entry.
    SAVE completo verificado en test/test_save.py: asignar los bloques, construir
@@ -184,26 +185,34 @@ el proyecto limpio.
      con un round-trip de recuperacion desde un BAM con basura.
    La capa logica del DOS esta completa. El BAM y la entrada de directorio se
    validan ademas byte a byte contra la referencia VICE (test/test_vice_ref.py).
-4c. Job queue de bajo nivel (capa fisica, dirigida por IRQ). Pendiente; requiere
-   verificacion en VICE/hardware, no en el harness py65. El banco de pruebas ya
-   esta montado: test/vice_monitor.py es un cliente del monitor binario de VICE que
-   arranca x64sc headless (bajo Xvfb), lee/escribe RAM y controla la ejecucion sin
-   tocar ninguna ROM (solo observa RAM, Nivel B). test/test_vice_boot.py es su
-   smoke test (arranca un C64 y comprueba el banner). Sobre esta base se escribira
-   y verificara la capa fisica: cargar dos.bin como ROM de unidad (-dos1541),
-   adjuntar un .d64 y comprobar por RAM que la unidad responde en el bus. Estos
-   tests requieren las ROMs propietarias del C64 (no incluidas en el repo) y por eso
-   no forman parte de "make test".
-
-   Primer contacto con hardware (verificado): test/test_vice_drive.py carga dos.bin
-   como ROM de unidad (-dos1541) con emulacion a nivel hardware y comprueba, leyendo
-   la pagina cero de la unidad por el monitor binario, que tras el reset aparece el
-   patron que escribe nuestro codigo (iec_dev=8, resto a 0). Es decir: el 6502 de la
-   1541 emulada ejecuta nuestro vector de reset, inicia las VIAs y entra en el bucle
-   del bus. Nuestra ROM arranca en el hardware emulado. Falta por verificar que la
-   unidad responda al bus IEC con el timing real y, sobre todo, la capa fisica del
-   disco (controlador IRQ, GCR a nivel de bit, motor, cabeza), que aun no existe.
-5. Tipos de fichero: SEQ, PRG, USR y por ultimo REL.
+4c. Capa fisica y bus en VICE (hecho): lectura y escritura de sector, seek, zona
+   de velocidad, LOAD y SAVE de extremo a extremo. Ver NOTAS_DISCO_VICE.md y
+   NOTAS_BUS_VICE.md. La cola de trabajos dirigida por IRQ de la unidad original
+   no se reproduce: el DOS es sincrono (Nivel 1).
+4d. (hecho) Canal 15 cableado al bus. OPEN 15 con nombre o PRINT#15 dejan el
+   texto en DATA_BUF; al UNLISTEN queda cmd_pending y el bucle principal lo
+   ejecuta (cmd_execute) antes de atender de nuevo el bus. TALK sobre el canal
+   15 sirve STATUS_BUF desde stat_rd, con EOI en el CR; leido entero, el estado
+   vuelve a 00. Ordenes: S (varios nombres, comodines * y ?), R, N (sin
+   formateo fisico), V, I, UJ/U: (reinicio). Desconocidas: 31. LOAD, SAVE y el
+   directorio fijan tambien el estado (21, 62, 63, 72...). LOAD de un fichero
+   inexistente suelta CLK y DATA tras el turnaround (antes los retenia y el host
+   esperaba sin fin): el host termina por tiempo. Verificado en VICE
+   con test/canal15_vice.py (C64 con las ROMs de Pascuals-BASIC, disco
+   comprobado con c1541, BAM igual a la que produce c1541 -validate).
+   Pendiente: formateo fisico en NEW, ordenes C, B, M y resto de U, proteccion
+   contra escritura, IRQ de ATN (CA1).
+   Contraste de caja negra con una 1541 de referencia en VICE
+   (test/oracle_estado_vice.py, solo se compara la cadena de estado que llega al
+   C64): coinciden los formatos de 00, 01, 21, 30, 31, 34, 62 y 63, espacios
+   incluidos. Diferencias conocidas: el texto de 73 (identificacion propia, a
+   proposito); SAVE con el disco lleno da 72,DISK FULL (la referencia da
+   67,ILLEGAL TRACK OR SECTOR,36,01, un efecto de su organizacion interna que no
+   se reproduce); sin disco, una orden tras un I fallido da 21 (la referencia
+   recuerda el estado y da 74,DRIVE NOT READY), y LOAD"$" informa 21 en 18/00
+   (la referencia en 18/01).
+5. Tipos de fichero: SEQ, PRG, USR y por ultimo REL. Pendiente: hoy todo se
+   graba como PRG y no hay canales de datos (OPEN/GET#/PRINT#) salvo LOAD/SAVE.
 
 ## Toolchain
 

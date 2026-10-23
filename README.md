@@ -38,13 +38,17 @@ disassembled):
   their result there (for example 62 FILE NOT FOUND, 63 FILE EXISTS, 72 DISK
   FULL). The power-on status is `73,PASCUAL DOS 1541,00,00`.
 - Wildcards in LOAD (`LOAD"*",8`, `LOAD"P*",8`). SAVE refuses an existing name
-  (63) instead of creating a duplicate entry.
+  (63) instead of creating a duplicate entry; `@0:name` replaces it.
+- Data channels 2 to 14: `OPEN 2,8,2,"NAME,S,W"` and friends, with types S, P
+  and U and modes R, W and A (append), read with `INPUT#`/`GET#` (EOI on the
+  last byte, ST=64) and written with `PRINT#`. Errors 62, 63, 64 FILE TYPE
+  MISMATCH and 70 NO CHANNEL.
 
 Not implemented yet: physical (low-level) formatting, so NEW only works on a
 disk that is already formatted (with an ID it rewrites the BAM and directory,
-not the sector headers); SEQ, USR and REL files and data channels other than
-LOAD and SAVE (every file is written as PRG); the C, B, M and remaining U
-commands (they answer 31,SYNTAX ERROR); write protect detection.
+not the sector headers); REL files and mode M; more than one data file open at
+a time (a second one answers 70); the C, B, M and remaining U commands (they
+answer 31,SYNTAX ERROR); write protect detection.
 
 Cross-checked against `c1541` as a reference and exercised from a C64 running both
 the original KERNAL and the free Pascuals-BASIC KERNAL.
@@ -151,12 +155,16 @@ desensambladas):
   resultado (por ejemplo 62 FILE NOT FOUND, 63 FILE EXISTS, 72 DISK FULL). El
   estado de arranque es `73,PASCUAL DOS 1541,00,00`.
 - Comodines en LOAD (`LOAD"*",8`, `LOAD"P*",8`). SAVE rechaza un nombre que ya
-  existe (63) en vez de crear una entrada duplicada.
+  existe (63) en vez de crear una entrada duplicada; `@0:nombre` lo reemplaza.
+- Canales de datos 2 a 14: `OPEN 2,8,2,"NOMBRE,S,W"` y similares, con tipos S, P
+  y U y modos R, W y A (anadir), lectura con `INPUT#`/`GET#` (EOI en el ultimo
+  byte, ST=64) y escritura con `PRINT#`. Errores 62, 63, 64 FILE TYPE MISMATCH y
+  70 NO CHANNEL.
 
 Pendiente: formateo fisico (de bajo nivel), por lo que NEW solo funciona sobre un
 disco ya formateado (con ID reescribe la BAM y el directorio, no las cabeceras de
-los sectores); ficheros SEQ, USR y REL y canales de datos distintos de LOAD y SAVE
-(todo se graba como PRG); los comandos C, B, M y el resto de U (responden
+los sectores); ficheros REL y modo M; mas de un fichero de datos abierto a la vez
+(el segundo responde 70); los comandos C, B, M y el resto de U (responden
 31,SYNTAX ERROR); deteccion de proteccion contra escritura.
 
 Contrastado contra `c1541` como referencia y ejercitado desde un C64 con el KERNAL

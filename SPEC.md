@@ -211,8 +211,35 @@ el proyecto limpio.
    se reproduce); sin disco, una orden tras un I fallido da 21 (la referencia
    recuerda el estado y da 74,DRIVE NOT READY), y LOAD"$" informa 21 en 18/00
    (la referencia en 18/01).
-5. Tipos de fichero: SEQ, PRG, USR y por ultimo REL. Pendiente: hoy todo se
-   graba como PRG y no hay canales de datos (OPEN/GET#/PRINT#) salvo LOAD/SAVE.
+5. (hecho salvo REL) Canales de datos 1 a 14. El OPEN deja el nombre en
+   DATA_BUF y al UNLISTEN queda open_pending; chan_open lo ejecuta desde el
+   bucle principal. chan_parse separa "[@][0:]nombre[,campo[,campo]]": cada campo
+   se clasifica por su letra (S, P, U, L tipos; R, W, A, M modos), de modo que
+   "NOMBRE,W" es un modo. Sin modo: escritura en el canal 1 (SAVE), lectura en
+   los demas; sin tipo al escribir: PRG en el canal 1, SEQ en los demas.
+   - Lectura (R): iec_talk_read entrega el fichero bloque a bloque desde
+     DATA_DEC_BUF, con EOI en el ultimo byte. La posicion se conserva entre TALKs
+     (GET# pide un byte por TALK). dsk_gen cambia cada vez que otra operacion
+     pisa DATA_DEC_BUF; si cambio, rd_ensure relee el bloque en curso.
+   - Escritura (W) y anadir (A): el camino del SAVE (SAVE_BUF, BAM en RAM) con
+     el tipo de la entrada en save_ftype. "@" reemplaza: al cerrar se borra la
+     version anterior (dir_walk) antes de crear la entrada. A recorre la cadena
+     hasta el ultimo bloque, sigue llenandolo y al cerrar actualiza el tamano de
+     la entrada existente.
+   - Un unico fichero de datos abierto a la vez (RAM de 2 KB con buffers
+     compartidos): otro OPEN con el primero abierto da 70 NO CHANNEL. La unidad de
+     referencia admite varios.
+   - Tolerancia a un host que atiende interrupciones en mitad del protocolo (con
+     el KERNAL libre se perdian bytes y aparecia ST=$80 de forma intermitente):
+     tras ATN se espera a ver CLK asertado antes del primer byte (con limite de
+     unos 12 ms); en el turnaround se espera a que el host suelte CLK antes de
+     tomarlo, y se mantiene asertado unos 5 ms antes del primer byte para que el
+     host no pierda el pulso. Como talker, un ATN a mitad de byte aborta el envio
+     y el byte no cuenta como entregado.
+   Verificado en VICE con test/canales_vice.py (ROMs del C64 originales y
+   libres; contenido y tipos comprobados con c1541) y contrastado con una 1541
+   de referencia como caja negra (test/oracle_canales_vice.py).
+   Pendiente: REL (tipo L), modo M, varios ficheros abiertos a la vez.
 
 ## Toolchain
 

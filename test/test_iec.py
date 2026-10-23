@@ -150,11 +150,22 @@ class Controller:
                 b.ctrl_atn = 1
                 yield from self._dwell()
             elif kind == "turnaround":
-                # el host pasa de talker a listener tras liberar ATN
-                b.ctrl_atn = 0
-                yield from self._wait(lambda: b.dev_clk)  # la 1541 toma CLK
-                b.ctrl_clk = 0
+                # el host pasa de talker a listener: aserta DATA, suelta ATN y
+                # CLK, y espera a que la 1541 tome CLK (protocolo publico)
                 b.ctrl_data = 1                           # host: listener listo
+                b.ctrl_atn = 0
+                yield from self._dwell()
+                b.ctrl_clk = 0
+                yield from self._wait(lambda: b.dev_clk)  # la 1541 toma CLK
+                yield from self._dwell()
+            elif kind == "turnaround_late":
+                # como "turnaround", pero el host tarda en soltar CLK tras soltar
+                # ATN (una interrupcion entre medias): la 1541 debe esperarle
+                b.ctrl_data = 1
+                b.ctrl_atn = 0
+                yield from self._dwell(400)
+                b.ctrl_clk = 0
+                yield from self._wait(lambda: b.dev_clk)
                 yield from self._dwell()
             elif kind == "as_listener":
                 # el host se coloca como listener sin turnaround previo (para
@@ -285,6 +296,15 @@ def main():
     TXTEST = 0x0700
     r.append(run_case("iec_talk_send: turnaround + 3 bytes con EOI",
         [("turnaround",), ("recv_eoi",)],
+        {"rx": [0x11, 0x22, 0x33], "rx_eoi": True},
+        entry="iec_talk_send",
+        preload={TXTEST: [0x11, 0x22, 0x33],
+                 "tx_ptr": [TXTEST & 0xFF, (TXTEST >> 8) & 0xFF],
+                 "tx_len": [3, 0],
+                 "tx_last": [0xFF]}))
+
+    r.append(run_case("iec_talk_send: turnaround con el host lento en soltar CLK",
+        [("turnaround_late",), ("recv_eoi",)],
         {"rx": [0x11, 0x22, 0x33], "rx_eoi": True},
         entry="iec_talk_send",
         preload={TXTEST: [0x11, 0x22, 0x33],

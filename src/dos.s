@@ -98,6 +98,11 @@ DIR_BUF    = $0700        ; sector de directorio (256 bytes)
 CHAIN_BUF  = $0700        ; buffer de sector para la cadena de fichero (compartido)
 SAVE_BUF   = $0700        ; buffer del sector en construccion durante un SAVE
 FTYPE_PRG_CLOSED = $82    ; tipo de entrada de directorio: PRG ($02) + cerrado ($80)
+FTYPE_SEQ_CLOSED = $81    ; SEQ ($01) + cerrado
+FTYPE_USR_CLOSED = $83    ; USR ($03) + cerrado
+CH_NONE  = 0              ; estado del canal de fichero (ch_dir)
+CH_READ  = 1
+CH_WRITE = 2
 HDR_MARK   = $08          ; marca de bloque de cabecera
 DATA_MARK  = $07          ; marca de bloque de datos
 MAX_SCAN   = $0800        ; bytes maximos a escanear por SYNC
@@ -117,7 +122,6 @@ iec_abort: .res 1         ; recepcion abortada por cambio de ATN
 iec_atn_exp: .res 1       ; nivel de ATN esperado ($80 comando, 0 datos)
 data_idx:  .res 1
 iec_chan_mode: .res 1     ; 0 = normal (nombre/LOAD), 1 = recibiendo datos de SAVE
-iec_save_opening: .res 1  ; $FF tras OPEN de un canal de escritura (espera nombre)
 iec_out:   .res 1         ; byte en transmision
 iec_send_eoi: .res 1      ; $FF si el byte a enviar lleva EOI
 tx_ptr:    .res 2         ; puntero del buffer a transmitir (talker)
@@ -224,6 +228,25 @@ walk_mode:   .res 1       ; 0 = SCRATCH, 1 = VALIDATE (dir_walk)
 chain_mode:  .res 1       ; 0 = liberar bloques, 1 = marcarlos ocupados
 chain_lim:   .res 2       ; limite de bloques al recorrer una cadena
 
+; --- canal de fichero (OPEN 2..14 / SAVE) ---
+open_pending: .res 1      ; $FF: llego el nombre de un OPEN de fichero
+open_sa:     .res 1       ; canal del OPEN pendiente
+open_type:   .res 1       ; tipo pedido: 0 cualquiera, o 'S','P','U','R'
+open_mode:   .res 1       ; modo pedido: 0 por defecto, o 'R','W','A','M'
+open_repl:   .res 1       ; $FF si el nombre empezaba por '@' (reemplazo)
+ch_sa:       .res 1       ; canal con fichero abierto
+ch_dir:      .res 1       ; CH_NONE, CH_READ o CH_WRITE
+save_ftype:  .res 1       ; tipo de la entrada al cerrar la escritura
+rd_track:    .res 1       ; bloque en curso de la lectura
+rd_sector:   .res 1
+rd_pos:      .res 1       ; indice del siguiente byte en el bloque (2..255)
+rd_end:      .res 1       ; indice del ultimo byte util del bloque
+rd_last:     .res 1       ; $FF si el bloque en curso es el ultimo
+rd_state:    .res 1       ; 0 bloque por cargar, 1 cargado, 2 fin de fichero
+rd_gen:      .res 1       ; dsk_gen cuando se cargo el bloque
+dsk_gen:     .res 1       ; cambia cada vez que se pisa DATA_DEC_BUF
+save_append: .res 1       ; $FF si la escritura anade a un fichero existente
+
 .code
 ; ----------------------------------------------------------------------------
 reset:
@@ -256,11 +279,16 @@ reset:
     sta iec_atn_exp
     sta data_idx
     sta iec_chan_mode
-    sta iec_save_opening
     sta save_active
     sta iec_send_eoi
     sta cmd_pending
     sta save_err
+    sta open_pending
+    sta ch_dir
+    sta open_repl
+    lda #FTYPE_PRG_CLOSED
+    sta save_ftype
+    lda #$00
     lda #73                     ; estado de arranque: identificacion del DOS
     sta err_code
     lda #$00
@@ -303,6 +331,10 @@ mainloop:
     beq @nocmd                  ; de atender el bus (el hardware sostiene DATA bajo
     jsr cmd_execute             ; ATN mientras tanto y el host espera)
 @nocmd:
+    lda open_pending            ; idem con el OPEN de un fichero
+    beq @noopen
+    jsr chan_open
+@noopen:
     lda VIA1_PB
     and #ATN_IN
     bne @atn
@@ -367,8 +399,22 @@ iec_recv_data:
 iec_talk:
     lda iec_sa
     cmp #15
-    bne @data
+    bne @not15
     jsr iec_talk_status         ; TALK sobre el canal 15: cadena de estado
+    jmp @done
+@not15:
+    cmp #0
+    beq @data                   ; canal 0: LOAD
+    cmp ch_sa
+    bne @nofile
+    lda ch_dir
+    cmp #CH_READ
+    bne @nofile
+    jsr iec_talk_read           ; fichero abierto para lectura en este canal
+    jmp @done
+@nofile:
+    jsr iec_turnaround          ; nada que enviar: el host termina por tiempo
+    jsr iec_release
     jmp @done
 @data:
     jsr iec_turnaround
@@ -410,6 +456,16 @@ iec_talk:
 iec_turnaround:
     lda #$00
     sta iec_abort
+    ; el host suelta CLK al pasar a listener. Hasta verlo suelto no se toma CLK:
+    ; si el host tarda (una interrupcion tras soltar ATN), soltar despues nuestro
+    ; CLK para el primer byte no se veria y el host no veria nunca el turnaround.
+@w_host:
+    lda VIA1_PB
+    and #ATN_IN
+    bne @abort
+    lda VIA1_PB
+    and #CLK_IN
+    bne @w_host
     lda VIA1_PB
     ora #CLK_OUT
     sta VIA1_PB
@@ -423,6 +479,18 @@ iec_turnaround:
     lda VIA1_PB
     and #DATA_IN
     beq @w_listener
+    ; mantener CLK asertado unos ms antes del primer byte: el host comprueba el
+    ; turnaround viendo CLK bajo, y si le llega una interrupcion justo al soltar
+    ; su CLK, un pulso corto se le escaparia (lo tomaria por unidad ausente)
+    ldx #2
+    ldy #0
+@hold:
+    lda VIA1_PB
+    bmi @abort                  ; ATN_IN es el bit 7
+    dey
+    bne @hold
+    dex
+    bne @hold
     rts
 @abort:
     lda #$FF
@@ -433,6 +501,12 @@ iec_turnaround:
 ;  ultimo byte (el CR) lleva EOI. Si el host corta con ATN a mitad (GET# lee un
 ;  byte por TALK), la posicion se conserva para el siguiente TALK. Leido entero,
 ;  el estado vuelve a "00, OK,00,00".
+iec_release:
+    lda VIA1_PB
+    and #<~(CLK_OUT | DATA_OUT)
+    sta VIA1_PB
+    rts
+
 iec_talk_status:
     jsr iec_turnaround
     lda iec_abort
@@ -623,9 +697,9 @@ iec_send_byte:
     ; liberar DATA (cierra el canal entre bytes), abortar sin enviar.
 @w_drel:
     lda VIA1_PB
-    and #ATN_IN
-    bne @abort
-    lda VIA1_PB
+    bpl @w_drel_d               ; ATN_IN es el bit 7
+    jmp @abort
+@w_drel_d:
     and #DATA_IN
     bne @w_drel
     ; EOI?
@@ -634,10 +708,16 @@ iec_send_byte:
     ; esperar el pulso de reconocimiento del listener (DATA asserted y liberada)
 @w_eoi_a:
     lda VIA1_PB
+    bpl @w_eoi_a2
+    jmp @abort
+@w_eoi_a2:
     and #DATA_IN
     beq @w_eoi_a
 @w_eoi_r:
     lda VIA1_PB
+    bpl @w_eoi_r2
+    jmp @abort
+@w_eoi_r2:
     and #DATA_IN
     bne @w_eoi_r
 @bits:
@@ -652,6 +732,8 @@ iec_send_byte:
     bne @d0
     ldx #8
 @bit:
+    bit VIA1_PB             ; ATN a mitad del byte: el host ya no escucha (cerro
+    bmi @abort_b            ; el canal); el byte no cuenta como entregado
     lsr iec_out             ; bit logico (LSB) al carry
     bcs @one
     ; logico 0 -> asertir DATA
@@ -689,14 +771,18 @@ iec_send_byte:
     sta VIA1_PB
     ; esperar acknowledge de frame: el listener asierta DATA
 @w_ack:
-    lda VIA1_PB
-    and #DATA_IN
+    lda VIA1_PB                 ; el acuse del listener cuenta aunque el host ya
+    and #DATA_IN                ; este retomando ATN: el byte llego entero
     beq @w_ack
     ; reposo: asertir CLK
     lda VIA1_PB
     ora #CLK_OUT
     sta VIA1_PB
     rts
+@abort_b:
+    lda VIA1_PB                 ; soltar CLK y DATA y abortar
+    and #<~(CLK_OUT | DATA_OUT)
+    sta VIA1_PB
 @abort:
     lda #$FF
     sta iec_abort
@@ -719,6 +805,24 @@ iec_atn:
     lda VIA1_PB
     ora #(DATA_OUT | ATNA)
     sta VIA1_PB
+    ; el controlador asierta CLK tras ATN antes de mandar el primer byte. Si un
+    ; host baja ATN y tarda en bajar CLK (una interrupcion entre medias), CLK
+    ; todavia liberado no significa "listo para enviar": se espera a verlo
+    ; asertado. Con limite (~12 ms) por si el host ya lo habia soltado mientras
+    ; la unidad estaba ocupada y llega tarde aqui.
+    ldx #3
+    ldy #0
+@w_ctl:
+    lda VIA1_PB
+    bmi @w_ctl_a
+    jmp @done                   ; ATN liberado
+@w_ctl_a:
+    and #CLK_IN
+    bne @cmdloop                ; CLK asertado: empieza la secuencia
+    dey
+    bne @w_ctl
+    dex
+    bne @w_ctl
 @cmdloop:
     lda VIA1_PB
     and #ATN_IN
@@ -748,7 +852,15 @@ iec_atn:
 @ul_empty:
     lda #$00
     sta iec_chan_mode
+    jmp @cmdloop
 @ul_done:
+    cmp #3                      ; fin del nombre de un OPEN de fichero
+    bne @ul_out
+    lda #$FF
+    sta open_pending
+    lda #$00
+    sta iec_chan_mode
+@ul_out:
     jmp @cmdloop
 @not_unlisten:
     cmp #$5F
@@ -788,7 +900,9 @@ iec_atn:
 @secondary:
     lda iec_state
     and #(ST_LISTEN | ST_TALK)
-    beq @cmdloop
+    bne @sec_mine
+    jmp @cmdloop                ; secundaria para otro dispositivo
+@sec_mine:
     lda iec_cmd
     and #$0F
     sta iec_sa
@@ -811,18 +925,15 @@ iec_atn:
     sta iec_chan_mode
     jmp @cmdloop
 @so_not15:
-    lda iec_sa                  ; canal 0 = LOAD; canal != 0 = posible SAVE
-    bne @so_go
-    lda #$00                    ; canal 0: nombre nuevo, reiniciar el indice de
-    sta data_idx                ; recepcion. Sin esto, en una peticion posterior
-    sta iec_chan_mode           ; el nombre se acumula mal alineado en DATA_BUF.
-    jmp @cmdloop
-@so_go:
-    lda #$FF
-    sta iec_save_opening        ; el nombre llega ahora; abrir al ver el DATA
-    lda #$00
+    lda #$00                    ; canal 0 (LOAD) o de fichero: llega un nombre
     sta data_idx
     sta iec_chan_mode
+    lda iec_sa
+    beq @so_done                ; canal 0: el nombre lo usa iec_talk
+    sta open_sa                 ; canal 1..14: abrir el fichero al UNLISTEN
+    lda #3
+    sta iec_chan_mode
+@so_done:
     jmp @cmdloop
 @sec_data:
     lda iec_sa
@@ -838,23 +949,21 @@ iec_atn:
 @sd15_done:
     jmp @cmdloop
 @sd_not15:
-    lda iec_sa
-    bne @sd_go
-    jmp @cmdloop                ; canal 0 (LOAD lo gestiona iec_talk)
-@sd_go:
-    lda iec_save_opening
-    bne @sd_open                ; veniamos de OPEN: abrir el fichero
-    lda save_active
-    bne @sd_mode                ; SAVE ya en curso
-    jmp @cmdloop                ; ni OPEN ni SAVE: datos normales (DATA_BUF)
-@sd_open:
-    jsr iec_copy_name           ; nombre recibido -> NAME_BUF
-    jsr file_save_open          ; asigna el primer bloque
+    lda iec_state
+    and #ST_LISTEN
+    beq @sd_done                ; como talker: iec_talk sirve el canal
     lda #$00
-    sta iec_save_opening
-@sd_mode:
+    sta iec_chan_mode           ; por defecto los datos van a DATA_BUF
+    lda iec_sa
+    beq @sd_done                ; canal 0
+    cmp ch_sa
+    bne @sd_done                ; canal sin fichero abierto
+    lda ch_dir
+    cmp #CH_WRITE
+    bne @sd_done                ; abierto para lectura: los datos se ignoran
     lda #1
     sta iec_chan_mode           ; los datos que siguen -> file_save_byte
+@sd_done:
     jmp @cmdloop
 @sec_close:
     lda iec_sa
@@ -864,14 +973,20 @@ iec_atn:
     sta iec_chan_mode
     jmp @cmdloop
 @sc_not15:
-    lda iec_sa
-    bne @sc_go
-    jmp @cmdloop
-@sc_go:
-    jsr file_save_close         ; ultimo sector + entrada de directorio
     lda #$00
     sta iec_chan_mode
-    sta iec_save_opening
+    lda iec_sa
+    beq @sc_done
+    cmp ch_sa
+    bne @sc_done                ; nada abierto en ese canal
+    lda ch_dir
+    cmp #CH_WRITE
+    bne @sc_free
+    jsr file_save_close         ; ultimo sector + entrada de directorio
+@sc_free:
+    lda #CH_NONE
+    sta ch_dir
+@sc_done:
     jmp @cmdloop
 @done:
     ; ATN liberado: devolver el control de DATA al hardware (ATNA=0) para que la
@@ -1308,6 +1423,7 @@ disk_read_block_gcr:
 ;  despues decodifica la cabecera; si es el sector buscado, decodifica y valida el
 ;  bloque. fsec_error = $00 exito (256 datos en DATA_DEC_BUF+1), $FF fallo.
 disk_find_sector_hw:
+    inc dsk_gen                 ; DATA_DEC_BUF va a cambiar (canal de lectura)
     lda #MAX_TRIES
     sta dsk_tries
 @try:
@@ -1512,6 +1628,7 @@ disk_write_sector_hw:
 ; ----------------------------------------------------------------------------
 ;  save_write_dec_to: codifica DATA_DEC_BUF y lo graba en want_track/want_sector.
 save_write_dec_to:
+    inc dsk_gen                 ; DATA_DEC_BUF lo ha rellenado quien escribe
     lda #<GCR_BLK
     sta gcr_dst
     lda #>GCR_BLK
@@ -1584,6 +1701,7 @@ file_save_open:
     sta save_blocks_hi
     sta save_err
     sta save_active
+    sta save_append
     jsr name_has_wild           ; un nombre con comodines no se puede grabar
     beq @namok
     lda #33
@@ -1592,6 +1710,8 @@ file_save_open:
     jsr dir_find_chain          ; ya existe? (DIR_BUF = SAVE_BUF, aun sin datos)
     lda dir_found
     beq @new
+    lda open_repl               ; "@nombre": se reemplaza al cerrar
+    bne @rdok
     lda #63                     ; FILE EXISTS: no se graba
     bne @refuse                 ; siempre
 @new:
@@ -1845,7 +1965,30 @@ file_save_close:
     sbc #1
     sta SAVE_BUF+1
     jsr save_write_cur
-    lda #FTYPE_PRG_CLOSED
+    lda save_append
+    beq @new_entry
+    jsr dir_find_chain          ; anadir: actualizar el tamano de la entrada
+    lda dir_found
+    beq @flush
+    lda dir_slot
+    clc
+    adc #30
+    tax
+    lda save_blocks_lo
+    sta DIR_BUF,x
+    lda save_blocks_hi
+    sta DIR_BUF+1,x
+    jsr dir_write_cur
+    jmp @flush
+@new_entry:
+    lda open_repl               ; reemplazo: borrar antes la version anterior (su
+    beq @norepl                 ; cadena vuelve a la BAM en RAM y su entrada queda
+    lda #$00                    ; libre para la nueva)
+    sta walk_mode
+    sta scr_count
+    jsr dir_walk
+@norepl:
+    lda save_ftype
     sta dir_ftype
     lda save_first_track
     sta dir_track
@@ -1856,9 +1999,11 @@ file_save_close:
     lda save_blocks_hi
     sta dir_blocks_hi
     jsr dir_add_chain           ; entrada en la cadena (extiende si esta llena)
+@flush:
     jsr save_bam_flush          ; graba la BAM a disco una sola vez
     lda #$00
     sta save_active
+    sta save_append
     lda fsec_error
     beq @ok
     lda #25                     ; fallo al grabar la BAM
@@ -3904,6 +4049,500 @@ cmd_user:
     jmp reset
 
 ; ----------------------------------------------------------------------------
+;  Canal de fichero (OPEN 1..14). El nombre llega como "[@][0:]nombre[,tipo[,modo]]"
+;  (formato del manual de usuario de la unidad): tipo S, P, U o R; modo R, W, A
+;  o M. Hay un solo canal de fichero a la vez (70 NO CHANNEL si ya hay otro).
+; ----------------------------------------------------------------------------
+;  chan_parse: separa DATA_BUF (data_idx bytes) en NAME_BUF (16, relleno $A0),
+;  open_type, open_mode y open_repl. A = $00 si el nombre esta vacio.
+chan_parse:
+    lda #$00
+    sta open_type
+    sta open_mode
+    sta open_repl
+    ldx #$00
+    cpx data_idx
+    beq @empty
+    lda DATA_BUF
+    cmp #'@'
+    bne @colon
+    lda #$FF
+    sta open_repl
+    inx                         ; saltar '@'
+@colon:
+    stx cmd_pos                 ; si hay ':' antes de la primera ',' el nombre
+@fc:                            ; empieza detras (prefijo de unidad "0:")
+    cpx data_idx
+    beq @nocolon
+    lda DATA_BUF,x
+    cmp #','
+    beq @nocolon
+    inx
+    cmp #':'
+    bne @fc
+    stx cmd_pos
+@nocolon:
+    ldx cmd_pos
+    ldy #$00
+@nm:
+    cpx data_idx
+    beq @pad
+    lda DATA_BUF,x
+    inx
+    cmp #','
+    beq @pad
+    cpy #16
+    bcs @nm                     ; truncar a 16
+    sta NAME_BUF,y
+    iny
+    bne @nm                     ; siempre
+@pad:
+    sty list_dig                ; longitud del nombre
+    lda #$A0
+@pl:
+    cpy #16
+    beq @opts
+    sta NAME_BUF,y
+    iny
+    bne @pl                     ; siempre
+@opts:                          ; cada campo se clasifica por su letra:
+    jsr @next_opt               ; S, P, U, L son tipos; R, W, A, M son modos
+    jsr @classify               ; ("NOMBRE,W" es un modo, no un tipo)
+    jsr @next_opt
+    jsr @classify
+    lda list_dig
+    rts
+@classify:
+    beq @cdone
+    cmp #'S'
+    beq @ctype
+    cmp #'P'
+    beq @ctype
+    cmp #'U'
+    beq @ctype
+    cmp #'L'
+    beq @ctype
+    cmp #'R'
+    beq @cmode
+    cmp #'W'
+    beq @cmode
+    cmp #'A'
+    beq @cmode
+    cmp #'M'
+    bne @cdone                  ; letra desconocida: se ignora
+@cmode:
+    sta open_mode
+    rts
+@ctype:
+    sta open_type
+@cdone:
+    rts
+@empty:
+    lda #$00
+    rts
+;  @next_opt: primer caracter del siguiente campo tras ',' (0 si no hay).
+;  X apunta a la posicion tras la ',' (o al final).
+@next_opt:
+    cpx data_idx
+    bcs @none
+    dex                         ; el caracter anterior debe ser ','
+    lda DATA_BUF,x
+    inx
+    cmp #','
+    bne @none
+    lda DATA_BUF,x              ; letra del campo
+    pha
+@skip:                          ; avanzar hasta la siguiente ',' (o el final)
+    cpx data_idx
+    beq @got
+    lda DATA_BUF,x
+    inx
+    cmp #','
+    bne @skip
+@got:
+    pla
+    rts
+@none:
+    lda #$00
+    rts
+
+;  chan_open: abre el fichero del OPEN pendiente (open_sa) con el nombre recibido.
+;  Lectura: lo localiza y deja la lectura en su primer bloque. Escritura: inicia
+;  la grabacion (comprobaciones de SAVE: comodines 33, existente 63, lleno 72).
+chan_open:
+    lda #$00
+    sta open_pending
+    jsr chan_parse
+    pha
+    lda #$00
+    sta data_idx
+    pla
+    bne @named
+    lda #34                     ; sin nombre
+    jmp @err
+@named:
+    lda ch_dir                  ; un unico canal de fichero
+    beq @free
+    lda ch_sa
+    cmp open_sa
+    beq @free                   ; reabrir el mismo canal lo sustituye
+    lda #70
+    jmp @err
+@free:
+    lda #CH_NONE
+    sta ch_dir
+    lda open_mode               ; modo por defecto: escritura en el canal 1
+    bne @mode                   ; (SAVE), lectura en los demas
+    lda #'R'
+    ldx open_sa
+    cpx #1
+    bne @setm
+    lda #'W'
+@setm:
+    sta open_mode
+@mode:
+    lda open_type
+    cmp #'L'
+    bne @notrel
+    jmp @norel                  ; ficheros relativos aun no implementados
+@notrel:
+    lda open_mode
+    cmp #'W'
+    beq @write
+    cmp #'R'
+    beq @read
+    cmp #'A'
+    bne @nomode
+    jmp @append
+@nomode:
+    lda #31                     ; M aun no implementado
+    jmp @err
+@write:
+    lda open_type               ; tipo de la entrada nueva
+    cmp #'S'
+    beq @wseq
+    cmp #'U'
+    beq @wusr
+    cmp #'P'
+    beq @wprg
+    lda open_sa                 ; sin tipo: PRG en el canal 1 (SAVE), SEQ en el
+    cmp #1                      ; resto
+    beq @wprg
+@wseq:
+    lda #FTYPE_SEQ_CLOSED
+    bne @wset                   ; siempre
+@wusr:
+    lda #FTYPE_USR_CLOSED
+    bne @wset                   ; siempre
+@wprg:
+    lda #FTYPE_PRG_CLOSED
+@wset:
+    sta save_ftype
+    jsr file_save_open          ; fija el estado si no puede (33, 63, 21, 72)
+    lda save_active
+    beq @ret
+    lda #CH_WRITE
+    bne @opened                 ; siempre
+@read:
+    jsr dir_find_chain          ; en lectura se admiten comodines
+    lda dir_found
+    bne @found
+    lda fsec_error
+    beq @nf
+    lda #21
+    jsr set_rw_error
+    jmp status_set
+@nf:
+    lda #62
+    jmp @err
+@found:
+    jsr chan_type_ok            ; tipo pedido distinto del fichero: 64
+    bcc @tok
+    lda #64
+    jmp @err
+@tok:
+    lda dir_track
+    sta rd_track
+    lda dir_sector
+    sta rd_sector
+    lda #2
+    sta rd_pos
+    lda #$00
+    sta rd_state                ; primer bloque por cargar
+    lda #CH_READ
+@opened:
+    sta ch_dir
+    lda open_sa
+    sta ch_sa
+    jmp status_ok
+@append:
+    jsr dir_find_chain          ; el fichero debe existir
+    lda dir_found
+    bne @afound
+    lda fsec_error
+    bne @rderr
+    lda #62
+    jmp @err
+@afound:
+    jsr chan_type_ok
+    bcc @aok
+    lda #64
+    jmp @err
+@aok:
+    jsr file_append_open        ; fija el estado si no puede (21, 72)
+    lda save_active
+    beq @ret
+    lda #CH_WRITE
+    jmp @opened
+@rderr:
+    lda #21
+    jsr set_rw_error
+    jmp status_set
+@norel:
+    lda #31                     ; ficheros relativos aun no implementados
+@err:
+    jsr set_error
+    jmp status_set
+@ret:
+    rts
+
+;  chan_type_ok: C = 0 si open_type (0 = cualquiera) casa con el tipo de la
+;  entrada encontrada (dir_ftype), C = 1 si no. La letra del tipo es la primera
+;  de su nombre en ftype_tab (DEL SEQ PRG USR REL).
+chan_type_ok:
+    lda open_type
+    beq @ok
+    lda dir_ftype
+    and #$07
+    sta list_dig
+    asl a
+    clc
+    adc list_dig
+    tax
+    lda ftype_tab,x
+    cmp open_type
+    bne @no
+@ok:
+    clc
+    rts
+@no:
+    sec
+    rts
+
+;  file_append_open: prepara la escritura al final del fichero encontrado
+;  (dir_track/sector, dir_blocks, dir_ftype). Recorre su cadena hasta el ultimo
+;  bloque y lo deja en SAVE_BUF para seguir llenandolo; si estaba lleno, enlaza
+;  ya uno nuevo. Al cerrar se actualiza el tamano de la entrada existente.
+file_append_open:
+    lda #$00
+    sta save_err
+    sta save_active
+    lda dir_track
+    sta save_first_track
+    sta file_next_track
+    lda dir_sector
+    sta save_first_sector
+    sta file_next_sector
+    lda dir_blocks_lo
+    sta save_blocks_lo
+    lda dir_blocks_hi
+    sta save_blocks_hi
+    lda dir_ftype
+    sta save_ftype
+    jsr bam_load_chk
+    bcs @fail
+    lda #<683
+    sta chain_lim
+    lda #>683
+    sta chain_lim+1
+@walk:
+    jsr disk_link_valid
+    beq @bad
+    lda file_next_track
+    sta want_track
+    sta save_cur_track
+    lda file_next_sector
+    sta want_sector
+    sta save_cur_sector
+    jsr disk_read_sector_hw
+    lda fsec_error
+    bne @rd
+    lda DATA_DEC_BUF+1          ; pista 0: ultimo bloque
+    beq @last
+    sta file_next_track
+    lda DATA_DEC_BUF+2
+    sta file_next_sector
+    lda chain_lim
+    bne @dl
+    dec chain_lim+1
+@dl:
+    dec chain_lim
+    lda chain_lim
+    ora chain_lim+1
+    bne @walk
+@bad:
+    lda #66                     ; cadena rota o en bucle
+    jsr set_error
+    jmp @fail
+@rd:
+    lda #21
+    jsr set_rw_error
+@fail:
+    jsr status_set
+    lda #$FF
+    sta save_err
+    rts
+@last:
+    ldx #$00                    ; ultimo bloque -> SAVE_BUF
+@cp:
+    lda DATA_DEC_BUF+1,x
+    sta SAVE_BUF,x
+    inx
+    bne @cp
+    lda DATA_DEC_BUF+2          ; offset del ultimo byte util: se sigue detras
+    clc
+    adc #1
+    sta save_idx
+    lda #$FF
+    sta save_active
+    sta save_append
+    lda save_idx
+    bne @ready
+    jsr save_alloc_block        ; bloque lleno: enlazar ya el siguiente
+    lda alloc_ok
+    bne @link
+    lda #72
+    jsr set_error
+    lda #$00
+    sta save_active
+    sta save_append
+    jmp @fail
+@link:
+    lda alloc_track
+    sta SAVE_BUF+0
+    lda alloc_sector
+    sta SAVE_BUF+1
+    jsr save_write_cur
+    lda alloc_track
+    sta save_cur_track
+    lda alloc_sector
+    sta save_cur_sector
+    inc save_blocks_lo
+    bne @nc
+    inc save_blocks_hi
+@nc:
+    lda #2
+    sta save_idx
+@ready:
+    rts
+
+;  rd_ensure: deja en DATA_DEC_BUF el bloque en curso de la lectura. Si otra
+;  operacion de disco lo piso (dsk_gen cambio), lo relee. Fija rd_end y rd_last.
+;  C = 1 si hubo error de lectura (estado 21 fijado).
+rd_ensure:
+    lda rd_state
+    beq @load
+    lda rd_gen
+    cmp dsk_gen
+    beq @ok
+@load:
+    lda rd_track
+    sta want_track
+    lda rd_sector
+    sta want_sector
+    jsr disk_read_sector_hw
+    lda fsec_error
+    bne @err
+    lda dsk_gen
+    sta rd_gen
+    lda #1
+    sta rd_state
+    lda DATA_DEC_BUF+1          ; enlace: pista 0 = ultimo bloque
+    beq @last
+    lda #255
+    sta rd_end
+    lda #$00
+    sta rd_last
+    clc
+    rts
+@last:
+    lda DATA_DEC_BUF+2          ; offset del ultimo byte util
+    sta rd_end
+    lda #$FF
+    sta rd_last
+@ok:
+    clc
+    rts
+@err:
+    lda #21
+    jsr set_rw_error
+    jsr status_set
+    sec
+    rts
+
+;  iec_talk_read: envia el fichero abierto para lectura desde la posicion en
+;  curso. El ultimo byte del fichero lleva EOI. Si el host corta con ATN (GET#
+;  pide un byte por TALK) la posicion se conserva. Acabado el fichero, no se
+;  envia nada mas (el host termina por tiempo).
+iec_talk_read:
+    jsr iec_turnaround
+    lda iec_abort
+    bne @ret
+@loop:
+    lda rd_state
+    cmp #2
+    beq @eof                    ; fichero ya entregado entero
+    jsr rd_ensure
+    bcs @eof
+    lda rd_pos                  ; bloque sin bytes pendientes (ultimo vacio)
+    cmp rd_end
+    beq @have
+    bcs @eof
+@have:
+    ldx rd_pos
+    lda DATA_DEC_BUF+1,x
+    sta iec_out
+    lda #$00                    ; EOI solo en el ultimo byte del fichero
+    ldx rd_last
+    beq @seteoi
+    ldx rd_pos
+    cpx rd_end
+    bne @seteoi
+    lda #$FF
+@seteoi:
+    sta iec_send_eoi
+    jsr iec_send_byte
+    lda iec_abort
+    bne @ret                    ; ATN: el byte no se consumio
+    lda iec_send_eoi
+    bne @done                   ; era el ultimo
+    lda rd_pos
+    cmp rd_end
+    beq @nextblk
+    inc rd_pos
+    jmp @loop
+@nextblk:
+    lda DATA_DEC_BUF+1          ; siguiente bloque de la cadena (el buffer es el
+    sta rd_track                ; bloque en curso: acaba de usarse)
+    lda DATA_DEC_BUF+2
+    sta rd_sector
+    lda #2
+    sta rd_pos
+    lda #$00
+    sta rd_state
+    jmp @loop
+@done:
+    lda #2
+    sta rd_state
+    rts
+@eof:
+    lda #2
+    sta rd_state
+    jsr iec_release
+@ret:
+    rts
+
+; ----------------------------------------------------------------------------
 ;  Listado de directorio (LOAD "$",8). La unidad genera un pseudo-programa BASIC
 ;  que el C64 LISTa como directorio. Cada linea es: enlace (2 bytes, no nulo, que
 ;  el cargador re-vincula), numero de linea (2 bytes LE = numero de bloques),
@@ -4176,6 +4815,12 @@ err_tab:
     .word msg_notfound
     .byte 63
     .word msg_exists
+    .byte 64
+    .word msg_mismatch
+    .byte 70
+    .word msg_nochannel
+    .byte 66
+    .word msg_illegal
     .byte 72
     .word msg_full
     .byte 73
@@ -4190,6 +4835,9 @@ msg_syntax:    .byte "SYNTAX ERROR", 0
 msg_notfound:  .byte " FILE NOT FOUND", 0
 msg_exists:    .byte " FILE EXISTS", 0
 msg_full:      .byte "DISK FULL", 0
+msg_mismatch:  .byte " FILE TYPE MISMATCH", 0
+msg_nochannel: .byte "NO CHANNEL", 0
+msg_illegal:   .byte "ILLEGAL TRACK OR SECTOR", 0
 msg_dosid:     .byte "PASCUAL DOS 1541", 0
 msg_generic:   .byte "ERROR", 0
 
